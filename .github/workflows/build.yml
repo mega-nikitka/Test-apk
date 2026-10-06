@@ -1,7 +1,5 @@
 name: Build APK
-on:
-  push:
-  workflow_dispatch:
+on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -36,8 +34,8 @@ jobs:
                   applicationId = "com.example.cam8k"
                   minSdk = 31
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "2.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -67,273 +65,341 @@ jobs:
               </application>
           </manifest>
           EOF
-          cat > app/src/main/java/com/example/cam8k/VideoRecorder.kt <<'EOF'
-          package com.example.cam8k
-
-          import android.annotation.SuppressLint
-          import android.content.Context
-          import android.hardware.camera2.*
-          import android.hardware.camera2.params.OutputConfiguration
-          import android.hardware.camera2.params.SessionConfiguration
-          import android.media.MediaRecorder
-          import android.os.Handler
-          import android.util.Range
-          import android.util.Size
-          import android.view.Surface
-          import java.io.File
-          import java.util.concurrent.Executor
-
-          class VideoRecorder(private val context: Context, private val handler: Handler) {
-
-              private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-              private val executor = Executor { handler.post(it) }
-              private var device: CameraDevice? = null
-              private var session: CameraCaptureSession? = null
-              private var recorder: MediaRecorder? = null
-
-              @SuppressLint("MissingPermission")
-              fun start(
-                  logicalId: String, physicalId: String?, outFile: File, preview: Surface,
-                  size: Size, fps: Int, started: () -> Unit, fail: (String) -> Unit
-              ) {
-                  try {
-                      recorder = buildRecorder(logicalId, outFile, size, fps)
-                  } catch (e: Exception) {
-                      fail("Recorder: ${e.message}"); return
-                  }
-                  val recSurface = recorder!!.surface
-                  try {
-                      manager.openCamera(logicalId, object : CameraDevice.StateCallback() {
-                          override fun onOpened(camera: CameraDevice) {
-                              device = camera
-                              createSession(camera, recSurface, preview, physicalId, fps, started, fail)
-                          }
-                          override fun onDisconnected(camera: CameraDevice) { camera.close() }
-                          override fun onError(camera: CameraDevice, error: Int) {
-                              camera.close(); fail("Camera error $error")
-                          }
-                      }, handler)
-                  } catch (e: Exception) { fail("Open: ${e.message}") }
-              }
-
-              private fun buildRecorder(id: String, file: File, size: Size, fps: Int): MediaRecorder {
-                  val orientation = manager.getCameraCharacteristics(id)
-                      .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-                  val mr = MediaRecorder(context)
-                  mr.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
-                  mr.setVideoSource(MediaRecorder.VideoSource.SURFACE)
-                  mr.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                  mr.setVideoEncoder(MediaRecorder.VideoEncoder.HEVC)
-                  mr.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                  mr.setVideoSize(size.width, size.height)
-                  mr.setVideoFrameRate(fps)
-                  mr.setVideoEncodingBitRate(if (size.width >= 3840) 80_000_000 else 30_000_000)
-                  mr.setAudioEncodingBitRate(192_000)
-                  mr.setAudioSamplingRate(48_000)
-                  mr.setOrientationHint(orientation)
-                  mr.setOutputFile(file.absolutePath)
-                  mr.prepare()
-                  return mr
-              }
-
-              private fun createSession(
-                  camera: CameraDevice, recSurface: Surface, preview: Surface, physicalId: String?,
-                  fps: Int, started: () -> Unit, fail: (String) -> Unit
-              ) {
-                  val rec = OutputConfiguration(recSurface)
-                  val prev = OutputConfiguration(preview)
-                  if (physicalId != null) {
-                      rec.setPhysicalCameraId(physicalId)
-                      prev.setPhysicalCameraId(physicalId)
-                  }
-                  val config = SessionConfiguration(
-                      SessionConfiguration.SESSION_REGULAR, listOf(rec, prev), executor,
-                      object : CameraCaptureSession.StateCallback() {
-                          override fun onConfigured(s: CameraCaptureSession) {
-                              try {
-                                  session = s
-                                  val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                                      addTarget(recSurface)
-                                      addTarget(preview)
-                                      set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
-                                  }.build()
-                                  s.setRepeatingRequest(req, null, handler)
-                                  recorder?.start()
-                                  started()
-                              } catch (e: Exception) { fail("Start: ${e.message}") }
-                          }
-                          override fun onConfigureFailed(s: CameraCaptureSession) {
-                              fail("Камера/режим не поддерживается прошивкой (сессия отклонена)")
-                          }
-                      }
-                  )
-                  try { camera.createCaptureSession(config) } catch (e: Exception) { fail("Session: ${e.message}") }
-              }
-
-              fun stop() {
-                  try { session?.stopRepeating(); session?.abortCaptures() } catch (_: Exception) {}
-                  try { recorder?.stop() } catch (_: Exception) {}
-                  recorder?.release(); recorder = null
-                  session?.close(); session = null
-                  device?.close(); device = null
-              }
-          }
-          EOF
           cat > app/src/main/java/com/example/cam8k/MainActivity.kt <<'EOF'
           package com.example.cam8k
 
           import android.Manifest
+          import android.annotation.SuppressLint
           import android.app.Activity
           import android.content.ContentValues
           import android.content.Context
           import android.content.pm.PackageManager
-          import android.hardware.camera2.CameraCharacteristics
-          import android.hardware.camera2.CameraManager
-          import android.os.Bundle
-          import android.os.Environment
-          import android.os.Handler
-          import android.os.HandlerThread
+          import android.graphics.*
+          import android.hardware.camera2.*
+          import android.hardware.camera2.params.OutputConfiguration
+          import android.hardware.camera2.params.SessionConfiguration
+          import android.media.MediaRecorder
+          import android.os.*
           import android.provider.MediaStore
-          import android.util.Size
-          import android.view.Surface
-          import android.view.TextureView
-          import android.view.ViewGroup
+          import android.util.Range
+          import android.view.*
           import android.widget.*
           import java.io.File
+          import java.util.concurrent.Executor
+
+          class ShutterView(c: Context) : View(c) {
+              var rec = false
+                  set(v) { field = v; invalidate() }
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              override fun onDraw(cv: Canvas) {
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = minOf(cx, cy)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = r * 0.08f
+                  p.color = Color.WHITE
+                  cv.drawCircle(cx, cy, r - p.strokeWidth / 2, p)
+                  p.style = Paint.Style.FILL
+                  p.color = Color.rgb(211, 47, 47)
+                  if (rec) cv.drawRoundRect(cx - r * .38f, cy - r * .38f, cx + r * .38f, cy + r * .38f, r * .12f, r * .12f, p)
+                  else cv.drawCircle(cx, cy, r * .74f, p)
+              }
+          }
 
           class MainActivity : Activity() {
 
-              private data class CamOpt(val label: String, val logical: String, val physical: String?)
+              private class Lens(val label: String, val zoom: Float, val phys: String?, val sort: Float)
 
               private val thread = HandlerThread("cam").also { it.start() }
               private val handler by lazy { Handler(thread.looper) }
-              private val opts = mutableListOf<CamOpt>()
+              private val executor = Executor { handler.post(it) }
+              private val ui = Handler(Looper.getMainLooper())
+              private val mgr by lazy { getSystemService(Context.CAMERA_SERVICE) as CameraManager }
+
               private val modes = listOf(
-                  "4K 30 fps" to Triple(3840, 2160, 30),
-                  "4K 24 fps" to Triple(3840, 2160, 24),
-                  "1080p 60 fps" to Triple(1920, 1080, 60),
-                  "1080p 30 fps" to Triple(1920, 1080, 30)
+                  "8K·24" to Triple(7680, 4320, 24),
+                  "4K·24" to Triple(3840, 2160, 24),
+                  "4K·30" to Triple(3840, 2160, 30),
+                  "4K·60" to Triple(3840, 2160, 60),
+                  "1080·30" to Triple(1920, 1080, 30),
+                  "1080·60" to Triple(1920, 1080, 60)
               )
-              private lateinit var tv: TextureView
-              private lateinit var status: TextView
-              private lateinit var camSpinner: Spinner
-              private lateinit var modeSpinner: Spinner
-              private lateinit var recBtn: Button
-              private var recorder: VideoRecorder? = null
-              private var recording = false
+              private var modeIdx = 2
+              private var front = false
+              private var zoom = 1f
+              private var physId: String? = null
+              @Volatile private var recording = false
+              @Volatile private var gen = 0
+
+              private var device: CameraDevice? = null
+              private var session: CameraCaptureSession? = null
+              private var recorder: MediaRecorder? = null
               private var file: File? = null
+              private var previewSurface: Surface? = null
+              private var recSurface: Surface? = null
+              private var lenses = listOf<Lens>()
+              private var t0 = 0L
+
+              private lateinit var tv: TextureView
+              private lateinit var shutter: ShutterView
+              private lateinit var timer: TextView
+              private lateinit var modeRow: LinearLayout
+              private lateinit var lensRow: LinearLayout
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (recording) {
+                          val s = (SystemClock.elapsedRealtime() - t0) / 1000
+                          timer.text = "%02d:%02d".format(s / 60, s % 60)
+                          ui.postDelayed(this, 500)
+                      }
+                  }
+              }
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-              private fun say(s: String) = runOnUiThread { status.text = s }
+              private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_LONG).show() }
+
+              private fun chip(t: String, click: () -> Unit) = TextView(this).apply {
+                  text = t
+                  textSize = 16f
+                  typeface = Typeface.DEFAULT_BOLD
+                  setTextColor(Color.WHITE)
+                  setPadding(dp(14), dp(8), dp(14), dp(8))
+                  setOnClickListener { click() }
+              }
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
-                  buildOptions()
+                  window.statusBarColor = Color.BLACK
+                  window.navigationBarColor = Color.BLACK
+                  val root = FrameLayout(this)
+                  root.setBackgroundColor(Color.BLACK)
+                  val sw = resources.displayMetrics.widthPixels
 
-                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(8), dp(8), dp(8)) }
                   tv = TextureView(this)
-                  root.addView(tv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-
-                  camSpinner = Spinner(this).apply {
-                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, opts.map { it.label })
+                  root.addView(tv, FrameLayout.LayoutParams(sw, sw * 16 / 9, Gravity.TOP).apply { topMargin = dp(84) })
+                  tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                      override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, h: Int) { startPreview() }
+                      override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) {}
+                      override fun onSurfaceTextureDestroyed(s: SurfaceTexture) = true
+                      override fun onSurfaceTextureUpdated(s: SurfaceTexture) {}
                   }
-                  modeSpinner = Spinner(this).apply {
-                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, modes.map { it.first })
-                  }
-                  recBtn = Button(this).apply { text = "ЗАПИСЬ"; setOnClickListener { toggle() } }
-                  val diag = Button(this).apply { text = "Диагностика"; setOnClickListener { say(report()) } }
-                  status = TextView(this).apply { text = "Готово"; textSize = 11f }
-                  val scroll = ScrollView(this).apply { addView(status) }
 
-                  root.addView(camSpinner); root.addView(modeSpinner); root.addView(recBtn); root.addView(diag)
-                  root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(140)))
+                  modeRow = LinearLayout(this)
+                  modes.forEachIndexed { i, m ->
+                      modeRow.addView(chip(m.first) {
+                          if (!recording && i != modeIdx) { modeIdx = i; refreshChips(); startPreview() }
+                      })
+                  }
+                  val hs = HorizontalScrollView(this)
+                  hs.isHorizontalScrollBarEnabled = false
+                  hs.addView(modeRow)
+                  root.addView(hs, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(32) })
+
+                  timer = TextView(this).apply {
+                      setTextColor(Color.rgb(255, 82, 82)); textSize = 18f
+                      typeface = Typeface.DEFAULT_BOLD; visibility = View.GONE
+                  }
+                  root.addView(timer, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(96) })
+
+                  lensRow = LinearLayout(this)
+                  root.addView(lensRow, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(150) })
+
+                  shutter = ShutterView(this)
+                  shutter.setOnClickListener { toggleRecord() }
+                  root.addView(shutter, FrameLayout.LayoutParams(dp(76), dp(76), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(48) })
+
+                  val flip = chip("⟲") {
+                      if (!recording) { front = !front; zoom = 1f; physId = null; startPreview() }
+                  }
+                  flip.textSize = 30f
+                  root.addView(flip, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply { bottomMargin = dp(52); marginEnd = dp(36) })
+
                   setContentView(root)
+                  refreshChips()
 
                   val need = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
                       .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
                   if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1)
               }
 
-              private fun buildOptions() {
-                  val m = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                  for (id in m.cameraIdList) {
-                      val c = m.getCameraCharacteristics(id)
-                      val front = c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
-                      if (front) { opts += CamOpt("Фронтальная ($id)", id, null); continue }
-                      val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
-                      opts += CamOpt("Задняя авто ($id) ${focal?.let { "%.1fmm".format(it) } ?: ""}", id, null)
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  startPreview()
+              }
+
+              override fun onResume() { super.onResume(); if (tv.isAvailable) startPreview() }
+
+              override fun onPause() {
+                  super.onPause()
+                  gen++
+                  handler.post { if (recording) finishRecording(false) else closeAll() }
+              }
+
+              private fun refreshChips() {
+                  val red = Color.rgb(229, 57, 53)
+                  for (i in 0 until modeRow.childCount)
+                      (modeRow.getChildAt(i) as TextView).setTextColor(if (i == modeIdx) red else Color.WHITE)
+                  for (i in 0 until lensRow.childCount) {
+                      val l = lenses[i]
+                      val on = l.phys == physId && Math.abs(l.zoom - zoom) < 0.01f
+                      (lensRow.getChildAt(i) as TextView).setTextColor(if (on) red else Color.WHITE)
+                  }
+              }
+
+              private fun buildLenses(id: String) {
+                  val c = mgr.getCameraCharacteristics(id)
+                  val r = c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) ?: Range(1f, 1f)
+                  val list = mutableListOf<Lens>()
+                  for (z in listOf(0.6f, 1f, 2f, 3.2f))
+                      if (z >= r.lower - 0.01f && z <= r.upper)
+                          list += Lens(if (z == 1f) "1x" else z.toString().removeSuffix(".0"), z, null, z)
+                  if (list.none { it.zoom == 1f }) list += Lens("1x", 1f, null, 1f)
+                  if (r.lower >= 0.99f && c.physicalCameraIds.isNotEmpty()) {
+                      val main = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 1f
                       for (pid in c.physicalCameraIds) {
-                          val pf = m.getCameraCharacteristics(pid)
-                              .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
-                          opts += CamOpt("  Модуль $pid ${pf?.let { "%.1fmm".format(it) } ?: ""}", id, pid)
+                          val pf = mgr.getCameraCharacteristics(pid)
+                              .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: continue
+                          val ratio = pf / main
+                          if (Math.abs(ratio - 1f) > 0.15f) list += Lens("%.1f".format(ratio), 1f, pid, ratio)
                       }
                   }
+                  lenses = list.sortedBy { it.sort }
+                  lensRow.removeAllViews()
+                  lenses.forEach { l -> lensRow.addView(chip(l.label) { onLens(l) }) }
+                  refreshChips()
               }
 
-              private fun toggle() {
-                  if (!recording) {
-                      if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-                          say("Нет разрешений на камеру/микрофон"); return
-                      }
-                      val st = tv.surfaceTexture ?: run { say("Превью не готово"); return }
-                      val o = opts[camSpinner.selectedItemPosition]
-                      val (w, h, fps) = modes[modeSpinner.selectedItemPosition].second
-                      st.setDefaultBufferSize(1920, 1080)
-                      file = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "cam8k_${System.currentTimeMillis()}.mp4")
-                      recorder = VideoRecorder(this, handler)
-                      say("Запуск...")
-                      recorder!!.start(o.logical, o.physical, file!!, Surface(st), Size(w, h), fps,
-                          started = { recording = true; runOnUiThread { recBtn.text = "СТОП"; status.text = "Идёт запись" } },
-                          fail = { msg -> recorder?.stop(); recording = false; say("Ошибка: $msg"); runOnUiThread { recBtn.text = "ЗАПИСЬ" } })
+              private fun onLens(l: Lens) {
+                  if (l.phys != physId) {
+                      if (recording) return
+                      physId = l.phys; zoom = l.zoom
+                      refreshChips(); startPreview()
                   } else {
-                      recorder?.stop(); recording = false
-                      recBtn.text = "ЗАПИСЬ"
-                      val f = file ?: return
-                      say("Сохранение в галерею...")
-                      handler.post { saveToGallery(f) }
+                      zoom = l.zoom
+                      refreshChips()
+                      handler.post { applyRequest() }
                   }
               }
 
-              private fun saveToGallery(f: File) {
+              private fun camId(): String = mgr.cameraIdList.first {
+                  mgr.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
+                      (if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK)
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun startPreview() {
+                  if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED ||
+                      checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ||
+                      !tv.isAvailable) return
+                  val g = ++gen
+                  val id = camId()
+                  runOnUiThread { buildLenses(id) }
+                  val (w, h, fps) = modes[modeIdx].second
+                  handler.post {
+                      if (g != gen) return@post
+                      closeAll()
+                      try {
+                          val st = tv.surfaceTexture!!
+                          st.setDefaultBufferSize(1920, 1080)
+                          previewSurface = Surface(st)
+                          buildRecorder(id, w, h, fps)
+                          mgr.openCamera(id, object : CameraDevice.StateCallback() {
+                              override fun onOpened(cam: CameraDevice) {
+                                  if (g != gen) { cam.close(); return }
+                                  device = cam
+                                  createSession(cam, g)
+                              }
+                              override fun onDisconnected(cam: CameraDevice) { cam.close() }
+                              override fun onError(cam: CameraDevice, e: Int) { cam.close(); toast("Ошибка камеры $e") }
+                          }, handler)
+                      } catch (e: Exception) { toast("Режим недоступен: ${e.message}") }
+                  }
+              }
+
+              private fun buildRecorder(id: String, w: Int, h: Int, fps: Int) {
+                  val o = mgr.getCameraCharacteristics(id).get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                  file = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "cam8k_${System.currentTimeMillis()}.mp4")
+                  val mr = MediaRecorder(this)
+                  recorder = mr
+                  mr.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+                  mr.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                  mr.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                  mr.setVideoEncoder(MediaRecorder.VideoEncoder.HEVC)
+                  mr.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                  mr.setVideoSize(w, h)
+                  mr.setVideoFrameRate(fps)
+                  mr.setVideoEncodingBitRate(minOf(100_000_000L, w.toLong() * h * fps * 3 / 10).toInt())
+                  mr.setAudioEncodingBitRate(192_000)
+                  mr.setAudioSamplingRate(48_000)
+                  mr.setOrientationHint(o)
+                  mr.setOutputFile(file!!.absolutePath)
+                  mr.prepare()
+                  recSurface = mr.surface
+              }
+
+              private fun createSession(cam: CameraDevice, g: Int) {
+                  val p = OutputConfiguration(previewSurface!!)
+                  val r = OutputConfiguration(recSurface!!)
+                  physId?.let { p.setPhysicalCameraId(it); r.setPhysicalCameraId(it) }
+                  val cfg = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, listOf(p, r), executor,
+                      object : CameraCaptureSession.StateCallback() {
+                          override fun onConfigured(s: CameraCaptureSession) {
+                              if (g != gen) { s.close(); return }
+                              session = s
+                              applyRequest()
+                          }
+                          override fun onConfigureFailed(s: CameraCaptureSession) {
+                              toast("Режим ${modes[modeIdx].first} не поддерживается прошивкой")
+                          }
+                      })
+                  try { cam.createCaptureSession(cfg) } catch (e: Exception) { toast("Сессия: ${e.message}") }
+              }
+
+              private fun applyRequest() {
+                  val d = device ?: return
+                  val s = session ?: return
+                  val ps = previewSurface ?: return
                   try {
-                      val v = ContentValues().apply {
-                          put(MediaStore.Video.Media.DISPLAY_NAME, f.name)
-                          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                          put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Cam8K")
-                      }
-                      val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)!!
-                      contentResolver.openOutputStream(uri)!!.use { out -> f.inputStream().use { it.copyTo(out) } }
-                      f.delete()
-                      say("Сохранено: Movies/Cam8K/${f.name}")
-                  } catch (e: Exception) { say("Ошибка сохранения: ${e.message}\nФайл: ${f.absolutePath}") }
+                      val fps = modes[modeIdx].second.third
+                      val b = d.createCaptureRequest(if (recording) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
+                      b.addTarget(ps)
+                      if (recording) b.addTarget(recSurface!!)
+                      b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
+                      b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
+                      s.setRepeatingRequest(b.build(), null, handler)
+                  } catch (e: Exception) { toast("Запрос: ${e.message}") }
               }
 
-              private fun report(): String {
-                  val m = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                  val sb = StringBuilder()
-                  for (id in m.cameraIdList) {
-                      val c = m.getCameraCharacteristics(id)
-                      val sizes = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                          ?.getOutputSizes(android.media.MediaRecorder::class.java)
-                          ?.sortedByDescending { it.width * it.height }?.take(3)
-                      sb.appendLine("Камера $id: физ=${c.physicalCameraIds} видео=$sizes")
+              private fun toggleRecord() {
+                  handler.post {
+                      if (!recording) {
+                          if (session == null) { toast("Камера ещё не готова"); return@post }
+                          try {
+                              recording = true
+                              applyRequest()
+                              recorder?.start()
+                              t0 = SystemClock.elapsedRealtime()
+                              runOnUiThread { shutter.rec = true; timer.visibility = View.VISIBLE; ui.post(tick) }
+                          } catch (e: Exception) {
+                              recording = false
+                              toast("Старт записи: ${e.message}")
+                              finishRecording(true)
+                          }
+                      } else finishRecording(true)
                   }
-                  return sb.toString()
               }
 
-              override fun onDestroy() { recorder?.stop(); thread.quitSafely(); super.onDestroy() }
-          }
-          EOF
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.7
-      - name: Build
-        run: gradle -p proj assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Cam8K-apk
-          path: proj/app/build/outputs/apk/debug/app-debug.apk
+              private fun finishRecording(restart: Boolean) {
+                  val was = recording
+                  val f = file
+                  recording = false
+                  if (was) {
+                      file = null
+                      try { session?.stopRepeating(); session?.abortCaptures() } catch (_: Exception) {}
+                      try { recorder?.stop() } catch (_: Exception) {}
+                  }
+                  closeAll()
+                  if (was && f != null) Thread { saveToGallery(f) }.start()
+                  runOnUiThread { shutter.rec = false; timer.visibility = View.GONE }
+                  if (restart) startPreview()
+       
