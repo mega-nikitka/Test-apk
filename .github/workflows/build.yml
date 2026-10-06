@@ -402,4 +402,43 @@ jobs:
                   if (was && f != null) Thread { saveToGallery(f) }.start()
                   runOnUiThread { shutter.rec = false; timer.visibility = View.GONE }
                   if (restart) startPreview()
-       
+              }
+
+              private fun closeAll() {
+                  try { session?.close() } catch (_: Exception) {}
+                  try { device?.close() } catch (_: Exception) {}
+                  try { recorder?.release() } catch (_: Exception) {}
+                  try { previewSurface?.release() } catch (_: Exception) {}
+                  session = null; device = null; recorder = null; previewSurface = null; recSurface = null
+                  file?.delete()
+                  file = null
+              }
+
+              private fun saveToGallery(f: File) {
+                  try {
+                      val v = ContentValues().apply {
+                          put(MediaStore.Video.Media.DISPLAY_NAME, f.name)
+                          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                          put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Cam8K")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)!!
+                      contentResolver.openOutputStream(uri)!!.use { out -> f.inputStream().use { it.copyTo(out) } }
+                      f.delete()
+                      toast("Сохранено: Movies/Cam8K")
+                  } catch (e: Exception) { toast("Ошибка сохранения: ${e.message}") }
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build
+        run: gradle -p proj assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cam8K-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk       
