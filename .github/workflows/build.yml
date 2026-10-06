@@ -1,1 +1,339 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project
+        run: |
+          mkdir -p proj/app/src/main/java/com/example/cam8k
+          cd proj
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Cam8K"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          echo "org.gradle.jvmargs=-Xmx2g" > gradle.properties
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.cam8k"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.cam8k"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-feature android:name="android.hardware.camera.any" />
+              <application
+                  android:label="Cam8K"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/cam8k/VideoRecorder.kt <<'EOF'
+          package com.example.cam8k
 
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.hardware.camera2.*
+          import android.hardware.camera2.params.OutputConfiguration
+          import android.hardware.camera2.params.SessionConfiguration
+          import android.media.MediaRecorder
+          import android.os.Handler
+          import android.util.Range
+          import android.util.Size
+          import android.view.Surface
+          import java.io.File
+          import java.util.concurrent.Executor
+
+          class VideoRecorder(private val context: Context, private val handler: Handler) {
+
+              private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+              private val executor = Executor { handler.post(it) }
+              private var device: CameraDevice? = null
+              private var session: CameraCaptureSession? = null
+              private var recorder: MediaRecorder? = null
+
+              @SuppressLint("MissingPermission")
+              fun start(
+                  logicalId: String, physicalId: String?, outFile: File, preview: Surface,
+                  size: Size, fps: Int, started: () -> Unit, fail: (String) -> Unit
+              ) {
+                  try {
+                      recorder = buildRecorder(logicalId, outFile, size, fps)
+                  } catch (e: Exception) {
+                      fail("Recorder: ${e.message}"); return
+                  }
+                  val recSurface = recorder!!.surface
+                  try {
+                      manager.openCamera(logicalId, object : CameraDevice.StateCallback() {
+                          override fun onOpened(camera: CameraDevice) {
+                              device = camera
+                              createSession(camera, recSurface, preview, physicalId, fps, started, fail)
+                          }
+                          override fun onDisconnected(camera: CameraDevice) { camera.close() }
+                          override fun onError(camera: CameraDevice, error: Int) {
+                              camera.close(); fail("Camera error $error")
+                          }
+                      }, handler)
+                  } catch (e: Exception) { fail("Open: ${e.message}") }
+              }
+
+              private fun buildRecorder(id: String, file: File, size: Size, fps: Int): MediaRecorder {
+                  val orientation = manager.getCameraCharacteristics(id)
+                      .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                  val mr = MediaRecorder(context)
+                  mr.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+                  mr.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                  mr.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                  mr.setVideoEncoder(MediaRecorder.VideoEncoder.HEVC)
+                  mr.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                  mr.setVideoSize(size.width, size.height)
+                  mr.setVideoFrameRate(fps)
+                  mr.setVideoEncodingBitRate(if (size.width >= 3840) 80_000_000 else 30_000_000)
+                  mr.setAudioEncodingBitRate(192_000)
+                  mr.setAudioSamplingRate(48_000)
+                  mr.setOrientationHint(orientation)
+                  mr.setOutputFile(file.absolutePath)
+                  mr.prepare()
+                  return mr
+              }
+
+              private fun createSession(
+                  camera: CameraDevice, recSurface: Surface, preview: Surface, physicalId: String?,
+                  fps: Int, started: () -> Unit, fail: (String) -> Unit
+              ) {
+                  val rec = OutputConfiguration(recSurface)
+                  val prev = OutputConfiguration(preview)
+                  if (physicalId != null) {
+                      rec.setPhysicalCameraId(physicalId)
+                      prev.setPhysicalCameraId(physicalId)
+                  }
+                  val config = SessionConfiguration(
+                      SessionConfiguration.SESSION_REGULAR, listOf(rec, prev), executor,
+                      object : CameraCaptureSession.StateCallback() {
+                          override fun onConfigured(s: CameraCaptureSession) {
+                              try {
+                                  session = s
+                                  val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                      addTarget(recSurface)
+                                      addTarget(preview)
+                                      set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
+                                  }.build()
+                                  s.setRepeatingRequest(req, null, handler)
+                                  recorder?.start()
+                                  started()
+                              } catch (e: Exception) { fail("Start: ${e.message}") }
+                          }
+                          override fun onConfigureFailed(s: CameraCaptureSession) {
+                              fail("Камера/режим не поддерживается прошивкой (сессия отклонена)")
+                          }
+                      }
+                  )
+                  try { camera.createCaptureSession(config) } catch (e: Exception) { fail("Session: ${e.message}") }
+              }
+
+              fun stop() {
+                  try { session?.stopRepeating(); session?.abortCaptures() } catch (_: Exception) {}
+                  try { recorder?.stop() } catch (_: Exception) {}
+                  recorder?.release(); recorder = null
+                  session?.close(); session = null
+                  device?.close(); device = null
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/cam8k/MainActivity.kt <<'EOF'
+          package com.example.cam8k
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.provider.MediaStore
+          import android.util.Size
+          import android.view.Surface
+          import android.view.TextureView
+          import android.view.ViewGroup
+          import android.widget.*
+          import java.io.File
+
+          class MainActivity : Activity() {
+
+              private data class CamOpt(val label: String, val logical: String, val physical: String?)
+
+              private val thread = HandlerThread("cam").also { it.start() }
+              private val handler by lazy { Handler(thread.looper) }
+              private val opts = mutableListOf<CamOpt>()
+              private val modes = listOf(
+                  "4K 30 fps" to Triple(3840, 2160, 30),
+                  "4K 24 fps" to Triple(3840, 2160, 24),
+                  "1080p 60 fps" to Triple(1920, 1080, 60),
+                  "1080p 30 fps" to Triple(1920, 1080, 30)
+              )
+              private lateinit var tv: TextureView
+              private lateinit var status: TextView
+              private lateinit var camSpinner: Spinner
+              private lateinit var modeSpinner: Spinner
+              private lateinit var recBtn: Button
+              private var recorder: VideoRecorder? = null
+              private var recording = false
+              private var file: File? = null
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun say(s: String) = runOnUiThread { status.text = s }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  buildOptions()
+
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(8), dp(8), dp(8)) }
+                  tv = TextureView(this)
+                  root.addView(tv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  camSpinner = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, opts.map { it.label })
+                  }
+                  modeSpinner = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, modes.map { it.first })
+                  }
+                  recBtn = Button(this).apply { text = "ЗАПИСЬ"; setOnClickListener { toggle() } }
+                  val diag = Button(this).apply { text = "Диагностика"; setOnClickListener { say(report()) } }
+                  status = TextView(this).apply { text = "Готово"; textSize = 11f }
+                  val scroll = ScrollView(this).apply { addView(status) }
+
+                  root.addView(camSpinner); root.addView(modeSpinner); root.addView(recBtn); root.addView(diag)
+                  root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(140)))
+                  setContentView(root)
+
+                  val need = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                      .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1)
+              }
+
+              private fun buildOptions() {
+                  val m = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                  for (id in m.cameraIdList) {
+                      val c = m.getCameraCharacteristics(id)
+                      val front = c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+                      if (front) { opts += CamOpt("Фронтальная ($id)", id, null); continue }
+                      val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+                      opts += CamOpt("Задняя авто ($id) ${focal?.let { "%.1fmm".format(it) } ?: ""}", id, null)
+                      for (pid in c.physicalCameraIds) {
+                          val pf = m.getCameraCharacteristics(pid)
+                              .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+                          opts += CamOpt("  Модуль $pid ${pf?.let { "%.1fmm".format(it) } ?: ""}", id, pid)
+                      }
+                  }
+              }
+
+              private fun toggle() {
+                  if (!recording) {
+                      if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                          say("Нет разрешений на камеру/микрофон"); return
+                      }
+                      val st = tv.surfaceTexture ?: run { say("Превью не готово"); return }
+                      val o = opts[camSpinner.selectedItemPosition]
+                      val (w, h, fps) = modes[modeSpinner.selectedItemPosition].second
+                      st.setDefaultBufferSize(1920, 1080)
+                      file = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "cam8k_${System.currentTimeMillis()}.mp4")
+                      recorder = VideoRecorder(this, handler)
+                      say("Запуск...")
+                      recorder!!.start(o.logical, o.physical, file!!, Surface(st), Size(w, h), fps,
+                          started = { recording = true; runOnUiThread { recBtn.text = "СТОП"; status.text = "Идёт запись" } },
+                          fail = { msg -> recorder?.stop(); recording = false; say("Ошибка: $msg"); runOnUiThread { recBtn.text = "ЗАПИСЬ" } })
+                  } else {
+                      recorder?.stop(); recording = false
+                      recBtn.text = "ЗАПИСЬ"
+                      val f = file ?: return
+                      say("Сохранение в галерею...")
+                      handler.post { saveToGallery(f) }
+                  }
+              }
+
+              private fun saveToGallery(f: File) {
+                  try {
+                      val v = ContentValues().apply {
+                          put(MediaStore.Video.Media.DISPLAY_NAME, f.name)
+                          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                          put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Cam8K")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)!!
+                      contentResolver.openOutputStream(uri)!!.use { out -> f.inputStream().use { it.copyTo(out) } }
+                      f.delete()
+                      say("Сохранено: Movies/Cam8K/${f.name}")
+                  } catch (e: Exception) { say("Ошибка сохранения: ${e.message}\nФайл: ${f.absolutePath}") }
+              }
+
+              private fun report(): String {
+                  val m = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                  val sb = StringBuilder()
+                  for (id in m.cameraIdList) {
+                      val c = m.getCameraCharacteristics(id)
+                      val sizes = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                          ?.getOutputSizes(android.media.MediaRecorder::class.java)
+                          ?.sortedByDescending { it.width * it.height }?.take(3)
+                      sb.appendLine("Камера $id: физ=${c.physicalCameraIds} видео=$sizes")
+                  }
+                  return sb.toString()
+              }
+
+              override fun onDestroy() { recorder?.stop(); thread.quitSafely(); super.onDestroy() }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build
+        run: gradle -p proj assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cam8K-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
