@@ -80,8 +80,9 @@ jobs:
           s=s.replace('ui.postDelayed(this, 130)','ui.postDelayed(this, 400)')
           assert 'fun refresh()' not in s
           open(p,'w',encoding='utf-8').write(s)
-          PY      - name: Icon and signing
-        run: |
+          PY    
+          - name: Icon and signing
+            run: |
           if [ ! -f cam8k.p12 ]; then
             keytool -genkeypair -keystore cam8k.p12 -storetype PKCS12 -storepass cam8kpass -keypass cam8kpass -alias cam8k -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Cam8K"
             git config user.name github-actions
