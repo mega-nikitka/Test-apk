@@ -71,16 +71,8 @@ jobs:
       - name: Patch glass
         run: |
           cp Glass.kt proj/app/src/main/java/com/example/cam8k/Glass.kt
-          python3 - <<'PY'
-          import re
-          p='proj/app/src/main/java/com/example/cam8k/MainActivity.kt'
-          s=open(p,encoding='utf-8').read()
-          s=re.sub(r'class GlassPanel\(.*?\n\}\n\nclass ShutterView','class ShutterView',s,count=1,flags=re.S)
-          s=s.replace('panels.forEach { it.refresh() }','if (!recording) refreshGlass(tv, panels)')
-          s=s.replace('ui.postDelayed(this, 130)','ui.postDelayed(this, 400)')
-          assert 'fun refresh()' not in s
-          open(p,'w',encoding='utf-8').write(s)
-          PY    
+                    python3 -c "import re; p='proj/app/src/main/java/com/example/cam8k/Glass.kt'; s=open(p,encoding='utf-8').read(); s=re.sub(r'class GlassPanel\(.*?\n\}\n\n', '', s, flags=re.DOTALL); s=s.replace('panels.forEach { it.refresh() }', ''); s=s.replace('ui.postDelayed(this, 130)', ''); assert 'fun refresh()' not in s; open(p,'w',encoding='utf-8').write(s)"
+      
           - name: Icon and signing
             run: |
           if [ ! -f cam8k.p12 ]; then
