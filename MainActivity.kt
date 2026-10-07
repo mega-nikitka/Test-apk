@@ -487,4 +487,221 @@ class MainActivity : Activity() {
         val g = ++gen
         val id = camId()
         prepare(id)
-        val st = 
+        val st =  tv.surfaceTexture ?: return
+        val mode = cur
+        val photo = photoMode
+        val pSize = photoSize
+        handler.post {
+            if (g != gen) return@post
+            closeAll()
+            try {
+                previewSurface = Surface(st)
+                if (photo) {
+                    val rd = ImageReader.newInstance(pSize.width, pSize.height, ImageFormat.JPEG, 2)
+                    rd.setOnImageAvailableListener({ saveJpeg(it) }, handler)
+                    reader = rd
+                } else buildRecorder(mode)
+                mgr.openCamera(id, object : CameraDevice.StateCallback() {
+                    override fun onOpened(cam: CameraDevice) {
+                        if (g != gen) { cam.close(); return }
+                        device = cam
+                        createSession(cam, g, photo)
+                    }
+                    override fun onDisconnected(cam: CameraDevice) { cam.close() }
+                    override fun onError(cam: CameraDevice, e: Int) { cam.close(); toast("Ошибка камеры $e") }
+                }, handler)
+            } catch (e: Exception) {
+                toast("Режим недоступен: ${e.message}")
+                if (!photo) fallback()?.let { cur = it; startPreview() }
+            }
+        }
+    }
+
+    private fun fallback(): Mode? {
+        val i = supported.indexOfFirst { it.w == cur.w && it.h == cur.h && it.fps == cur.fps }
+        return supported.getOrNull(i + 1)
+    }
+
+    private fun buildRecorder(m: Mode) {
+        file = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "cam8k_${System.currentTimeMillis()}.mp4")
+        val mr = MediaRecorder(this)
+        recorder = mr
+        mr.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+        mr.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+        mr.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+        mr.setVideoEncoder(MediaRecorder.VideoEncoder.HEVC)
+        mr.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+        mr.setVideoSize(m.w, m.h)
+        mr.setVideoFrameRate(m.fps)
+        mr.setVideoEncodingBitRate(minOf(100_000_000L, m.w.toLong() * m.h * m.fps * 3 / 10).toInt())
+        mr.setAudioEncodingBitRate(192_000)
+        mr.setAudioSamplingRate(48_000)
+        mr.setOrientationHint(sensorOrientation)
+        mr.setOutputFile(file!!.absolutePath)
+        mr.prepare()
+        recSurface = mr.surface
+    }    private fun createSession(cam: CameraDevice, g: Int, photo: Boolean) {
+        val p = OutputConfiguration(previewSurface!!)
+        val second = OutputConfiguration(if (photo) reader!!.surface else recSurface!!)
+        physId?.let { p.setPhysicalCameraId(it); second.setPhysicalCameraId(it) }
+        val cfg = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, listOf(p, second), executor,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
+                    if (g != gen) { s.close(); return }
+                    session = s
+                    applyRequest()
+                }
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    if (g != gen) return
+                    if (physId != null) {
+                        physId = null; zoom = 1f
+                        toast("Этот модуль прошивка не отдаёт, включаю основную камеру")
+                        startPreview()
+                        return
+                    }
+                    val next = if (photo) null else fallback()
+                    if (next != null) {
+                        toast("${cur.label}·${cur.fps} не поддерживается, перехожу на ${next.label}·${next.fps}")
+                        cur = next
+                        startPreview()
+                    } else toast("Не удалось запустить камеру")
+                }
+            })
+        try { cam.createCaptureSession(cfg) } catch (e: Exception) { toast("Сессия: ${e.message}") }
+    }
+
+    private fun applyRequest() {
+        val d = device ?: return
+        val s = session ?: return
+        val ps = previewSurface ?: return
+        try {
+            val b = d.createCaptureRequest(if (recording) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
+            b.addTarget(ps)
+            if (recording) b.addTarget(recSurface!!)
+            if (!photoMode) {
+                val f = cur.fps
+                val range = fpsRanges.firstOrNull { it.lower == f && it.upper == f }
+                    ?: fpsRanges.filter { it.lower <= f && f <= it.upper }.minByOrNull { it.upper - it.lower }
+                    ?: Range(f, f)
+                b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+            }
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
+            b.set(
+                CaptureRequest.CONTROL_AF_MODE,
+                if (recording || !photoMode) CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            )
+            s.setRepeatingRequest(b.build(), null, handler)
+        } catch (e: Exception) { toast("Запрос: ${e.message}") }
+    }
+
+    // ---------- photo ----------
+
+    private fun takePhoto() {
+        handler.post {
+            val d = device ?: return@post
+            val s = session ?: return@post
+            val rd = reader ?: return@post
+            try {
+                val b = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                b.addTarget(rd.surface)
+                b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
+                b.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
+                s.capture(b.build(), null, handler)
+                runOnUiThread {
+                    tv.animate().alpha(0.3f).setDuration(60).withEndAction {
+                        tv.animate().alpha(1f).setDuration(140).start()
+                    }.start()
+                }
+            } catch (e: Exception) { toast("Фото: ${e.message}") }
+        }
+    }
+
+    private fun saveJpeg(r: ImageReader) {
+        val img = r.acquireLatestImage() ?: return
+        try {
+            val buf = img.planes[0].buffer
+            val bytes = ByteArray(buf.remaining())
+            buf.get(bytes)
+            val v = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, "cam8k_${System.currentTimeMillis()}.jpg")
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Cam8K")
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)!!
+            contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
+            toast("Фото сохранено: Pictures/Cam8K")
+        } catch (e: Exception) {
+            toast("Ошибка сохранения фото: ${e.message}")
+        } finally { img.close() }
+    }    // ---------- video ----------
+
+    private fun toggleRecord() {
+        handler.post {
+            if (!recording) {
+                if (session == null) { toast("Камера ещё не готова"); return@post }
+                try {
+                    recording = true
+                    applyRequest()
+                    recorder?.start()
+                    t0 = SystemClock.elapsedRealtime()
+                    runOnUiThread {
+                        shutter.animateRecording(true)
+                        timer.alpha = 0f
+                        timer.visibility = View.VISIBLE
+                        timer.animate().alpha(1f).setDuration(200).start()
+                        toggleDrawer(false)
+                        ui.post(tick)
+                    }
+                } catch (e: Exception) {
+                    recording = false
+                    toast("Старт записи: ${e.message}")
+                    finishRecording(true)
+                }
+            } else finishRecording(true)
+        }
+    }
+
+    private fun finishRecording(restart: Boolean) {
+        val was = recording
+        val f = file
+        recording = false
+        if (was) {
+            file = null
+            try { session?.stopRepeating(); session?.abortCaptures() } catch (_: Exception) {}
+            try { recorder?.stop() } catch (_: Exception) {}
+        }
+        closeAll()
+        if (was && f != null) Thread { saveToGallery(f) }.start()
+        runOnUiThread { shutter.animateRecording(false); timer.visibility = View.GONE }
+        if (restart) startPreview()
+    }
+
+    private fun closeAll() {
+        try { session?.close() } catch (_: Exception) {}
+        try { device?.close() } catch (_: Exception) {}
+        try { recorder?.release() } catch (_: Exception) {}
+        try { reader?.close() } catch (_: Exception) {}
+        try { previewSurface?.release() } catch (_: Exception) {}
+        session = null; device = null; recorder = null; reader = null
+        previewSurface = null; recSurface = null
+        file?.delete()
+        file = null
+    }
+
+    private fun saveToGallery(f: File) {
+        try {
+            val v = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, f.name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Cam8K")
+            }
+            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)!!
+            contentResolver.openOutputStream(uri)!!.use { out -> f.inputStream().use { it.copyTo(out) } }
+            f.delete()
+            toast("Видео сохранено: Movies/Cam8K")
+        } catch (e: Exception) { toast("Ошибка сохранения: ${e.message}") }
+    }
+
+    override fun onDestroy() { thread.quitSafely(); super.onDestroy() }
+}
