@@ -5,27 +5,33 @@ import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
-import android.graphics.RenderEffect
-import android.graphics.Shader
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.*
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.ExifInterface
 import android.media.ImageReader
 import android.media.MediaCodecList
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.*
 import android.provider.MediaStore
 import android.util.Range
@@ -33,55 +39,14 @@ import android.util.Size
 import android.view.*
 import android.view.animation.DecelerateInterpolator
 import android.widget.*
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.Executor
 import kotlin.math.abs
 
 private val RED = Color.rgb(217, 38, 44)
-
-private fun sheen(r: Float) = GradientDrawable(
-    GradientDrawable.Orientation.TOP_BOTTOM,
-    intArrayOf(Color.argb(90, 255, 255, 255), Color.argb(24, 255, 255, 255))
-).apply { cornerRadius = r; setStroke(2, Color.argb(150, 255, 255, 255)) }
-
-class GlassPanel(c: Context, private val src: TextureView, private val rad: Float) : FrameLayout(c) {
-    private val back = ImageView(c)
-    private var bmp: Bitmap? = null
-
-    init {
-        back.scaleType = ImageView.ScaleType.FIT_XY
-        back.setColorFilter(Color.argb(95, 0, 0, 0))
-        back.setRenderEffect(RenderEffect.createBlurEffect(16f, 16f, Shader.TileMode.CLAMP))
-        addView(back, FrameLayout.LayoutParams(-1, -1))
-        val top = View(c)
-        top.background = sheen(rad)
-        addView(top, FrameLayout.LayoutParams(-1, -1))
-        clipToOutline = true
-        outlineProvider = object : ViewOutlineProvider() {
-            override fun getOutline(v: View, o: Outline) { o.setRoundRect(0, 0, v.width, v.height, rad) }
-        }
-    }
-
-    fun refresh() {
-        if (!isShown || width == 0 || height == 0 || !src.isAvailable || src.width == 0) return
-        val loc = IntArray(2)
-        val tl = IntArray(2)
-        getLocationInWindow(loc)
-        src.getLocationInWindow(tl)
-        val s = 0.125f
-        val sw = (src.width * s).toInt().coerceAtLeast(2)
-        val sh = (src.height * s).toInt().coerceAtLeast(2)
-        val b = bmp?.takeIf { it.width == sw && it.height == sh }
-            ?: Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888).also { bmp = it }
-        src.getBitmap(b)
-        val x = ((loc[0] - tl[0]) * s).toInt().coerceIn(0, sw - 1)
-        val y = ((loc[1] - tl[1]) * s).toInt().coerceIn(0, sh - 1)
-        val w = (width * s).toInt().coerceIn(1, sw - x)
-        val h = (height * s).toInt().coerceIn(1, sh - y)
-        back.setImageBitmap(Bitmap.createBitmap(b, x, y, w, h))
-    }
-}
 
 class ShutterView(c: Context) : View(c) {
     var photo = false
@@ -121,6 +86,20 @@ class ShutterView(c: Context) : View(c) {
     }
 }
 
+class ThirdsView(c: Context) : View(c) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(120, 255, 255, 255)
+        strokeWidth = 2f
+    }
+
+    override fun onDraw(cv: Canvas) {
+        for (i in 1..2) {
+            cv.drawLine(width * i / 3f, 0f, width * i / 3f, height.toFloat(), p)
+            cv.drawLine(0f, height * i / 3f, width.toFloat(), height * i / 3f, p)
+        }
+    }
+}
+
 class MainActivity : Activity() {
 
     private class Lens(val label: String, val zoom: Float, val phys: String?, val ratio: Float)
@@ -131,6 +110,7 @@ class MainActivity : Activity() {
     private val executor = Executor { handler.post(it) }
     private val ui = Handler(Looper.getMainLooper())
     private val mgr by lazy { getSystemService(Context.CAMERA_SERVICE) as CameraManager }
+    private val prefs by lazy { getSharedPreferences("cam8k", MODE_PRIVATE) }
 
     private var supported = listOf<Mode>()
     private var fpsRanges = listOf<Range<Int>>()
@@ -147,8 +127,23 @@ class MainActivity : Activity() {
     @Volatile private var gen = 0
     @Volatile private var zoomPending = false
     @Volatile private var measured = 0.0
+    @Volatile private var lowSecs = 0
     private var tsStart = 0L
     private var frames = 0
+
+    private var chars: CameraCharacteristics? = null
+    private var maxAf = 0
+    private var maxAe = 0
+    private var hdrAvail = false
+    private var focusRegion: MeteringRectangle? = null
+    private var wmOn = true
+    private var hdrOn = false
+    private var gridOn = false
+    private var lastUri: Uri? = null
+    private var lastVideo = false
+    private var downX = 0f
+    private var downY = 0f
+    private var pinched = false
 
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
@@ -163,7 +158,11 @@ class MainActivity : Activity() {
     private var zoomAnim: ValueAnimator? = null
     private val panels = mutableListOf<GlassPanel>()
 
+    private lateinit var stage: FrameLayout
     private lateinit var tv: TextureView
+    private lateinit var grid: ThirdsView
+    private lateinit var ring: View
+    private lateinit var thumb: ImageView
     private lateinit var shutter: ShutterView
     private lateinit var timer: TextView
     private lateinit var pillText: TextView
@@ -173,6 +172,7 @@ class MainActivity : Activity() {
     private lateinit var lensPanel: GlassPanel
     private lateinit var resRow: LinearLayout
     private lateinit var fpsRow: LinearLayout
+    private lateinit var tgRow: LinearLayout
     private lateinit var lensRow: LinearLayout
     private lateinit var modeVideo: TextView
     private lateinit var modePhoto: TextView
@@ -190,8 +190,8 @@ class MainActivity : Activity() {
 
     private val glassTick = object : Runnable {
         override fun run() {
-            panels.forEach { it.refresh() }
-            ui.postDelayed(this, 130)
+            if (!recording) refreshGlass(tv, panels)
+            ui.postDelayed(this, 400)
         }
     }
 
@@ -204,6 +204,17 @@ class MainActivity : Activity() {
                 measured = frames * 1e9 / (ts - tsStart)
                 tsStart = ts
                 frames = 0
+                val target = cur.fps
+                if (!photoMode && physId != null && target > 30 && measured < target * 0.6) lowSecs++ else lowSecs = 0
+                if (lowSecs >= 4 && !recording) {
+                    lowSecs = 0
+                    val m = supported.firstOrNull { it.w == cur.w && it.h == cur.h && it.fps == 30 }
+                    if (m != null) {
+                        cur = m
+                        toast("Этот модуль не держит $target fps, переключил на 30")
+                        startPreview()
+                    }
+                }
                 runOnUiThread { refreshInfo() }
             }
         }
@@ -243,11 +254,28 @@ class MainActivity : Activity() {
         super.onCreate(b)
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
+        wmOn = prefs.getBoolean("wm", true)
+        hdrOn = prefs.getBoolean("hdr", false)
+        gridOn = prefs.getBoolean("grid", false)
         val sw = resources.displayMetrics.widthPixels
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
+        stage = FrameLayout(this)
         tv = TextureView(this)
-        root.addView(tv, FrameLayout.LayoutParams(sw, sw * 16 / 9, Gravity.TOP).apply { topMargin = dp(56) })
+        stage.addView(tv, FrameLayout.LayoutParams(-1, -1))
+        grid = ThirdsView(this)
+        grid.visibility = if (gridOn) View.VISIBLE else View.GONE
+        stage.addView(grid, FrameLayout.LayoutParams(-1, -1))
+        ring = View(this)
+        ring.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.TRANSPARENT)
+            setStroke(dp(2), Color.WHITE)
+        }
+        ring.visibility = View.GONE
+        stage.addView(ring, FrameLayout.LayoutParams(dp(64), dp(64)))
+        root.addView(stage, FrameLayout.LayoutParams(sw, sw * 16 / 9, Gravity.TOP).apply { topMargin = dp(56) })
+
         tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, h: Int) { startPreview() }
             override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) {}
@@ -256,13 +284,21 @@ class MainActivity : Activity() {
         }
         val scale = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(d: ScaleGestureDetector): Boolean {
+                pinched = true
                 if (physId == null) changeZoom(zoom * d.scaleFactor)
                 return true
             }
         })
-        tv.setOnTouchListener { _, e ->
+        tv.setOnTouchListener { v, e ->
             scale.onTouchEvent(e)
-            if (e.actionMasked == MotionEvent.ACTION_UP && !scale.isInProgress && drawerOpen) toggleDrawer(false)
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { downX = e.x; downY = e.y; pinched = false }
+                MotionEvent.ACTION_UP -> {
+                    if (drawerOpen) toggleDrawer(false)
+                    else if (!pinched && abs(e.x - downX) < dp(12) && abs(e.y - downY) < dp(12))
+                        focusAt(e.x / v.width, e.y / v.height, e.x, e.y)
+                }
+            }
             true
         }
 
@@ -306,6 +342,7 @@ class MainActivity : Activity() {
 
         resRow = LinearLayout(this)
         fpsRow = LinearLayout(this)
+        tgRow = LinearLayout(this)
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(12))
@@ -313,6 +350,8 @@ class MainActivity : Activity() {
             addView(resRow)
             addView(caption("КАДРОВ В СЕКУНДУ"))
             addView(fpsRow)
+            addView(caption("КАДР И ФОТО"))
+            addView(tgRow)
         }
         drawer = panel(col, 22, -1)
         drawer.visibility = View.GONE
@@ -339,6 +378,17 @@ class MainActivity : Activity() {
         }
         root.addView(shutter, FrameLayout.LayoutParams(dp(76), dp(76), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(36) })
 
+        thumb = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(Color.argb(60, 255, 255, 255))
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(v: View, o: Outline) { o.setRoundRect(0, 0, v.width, v.height, dp(14).toFloat()) }
+            }
+            setOnClickListener { openLast() }
+        }
+        root.addView(thumb, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.BOTTOM or Gravity.START).apply { bottomMargin = dp(48); marginStart = dp(32) })
+
         val flip = chip("⟲") {
             if (!recording) { front = !front; zoom = 1f; physId = null; startPreview() }
         }
@@ -359,6 +409,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         ui.post(glassTick)
+        loadLast()
         if (tv.isAvailable) startPreview()
     }
 
@@ -423,6 +474,33 @@ class MainActivity : Activity() {
             v.setTextColor(if (f == cur.fps) RED else Color.WHITE)
             fpsRow.addView(v)
         }
+        refreshToggles()
+    }
+
+    private fun refreshToggles() {
+        tgRow.removeAllViews()
+        fun add(name: String, on: Boolean, f: () -> Unit) {
+            val v = chip(name) { f(); refreshToggles() }
+            v.setTextColor(if (on) RED else Color.WHITE)
+            tgRow.addView(v)
+        }
+        add("HDR", hdrOn) {
+            if (!hdrAvail && !hdrOn) toast("HDR-режим камеры недоступен на этом телефоне")
+            else {
+                hdrOn = !hdrOn
+                prefs.edit().putBoolean("hdr", hdrOn).apply()
+                handler.post { applyRequest() }
+            }
+        }
+        add("СЕТКА", gridOn) {
+            gridOn = !gridOn
+            prefs.edit().putBoolean("grid", gridOn).apply()
+            grid.visibility = if (gridOn) View.VISIBLE else View.GONE
+        }
+        add("ЗНАК", wmOn) {
+            wmOn = !wmOn
+            prefs.edit().putBoolean("wm", wmOn).apply()
+        }
     }
 
     private fun toggleDrawer(open: Boolean) {
@@ -457,9 +535,84 @@ class MainActivity : Activity() {
     private fun layoutPreview() {
         val sw = resources.displayMetrics.widthPixels
         val ratio = if (photoMode) photoSize.width.toFloat() / photoSize.height else cur.w.toFloat() / cur.h
-        val lp = tv.layoutParams as FrameLayout.LayoutParams
+        val lp = stage.layoutParams as FrameLayout.LayoutParams
         lp.height = (sw * ratio).toInt()
-        tv.layoutParams = lp
+        stage.layoutParams = lp
+    }
+
+    // ---------- gallery button ----------
+
+    private fun openLast() {
+        val u = lastUri ?: return
+        try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(u, if (lastVideo) "video/*" else "image/*")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            )
+        } catch (e: Exception) { toast("Не удалось открыть: ${e.message}") }
+    }
+
+    private fun loadLast() {
+        Thread {
+            try {
+                var bestUri: Uri? = null
+                var bestVideo = false
+                var bestT = -1L
+                val col = MediaStore.MediaColumns.DATE_ADDED
+                for (vid in listOf(false, true)) {
+                    val base = if (vid) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                    val path = if (vid) "Movies/Cam8K%" else "Pictures/Cam8K%"
+                    contentResolver.query(
+                        base, arrayOf(MediaStore.MediaColumns._ID, col),
+                        MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?", arrayOf(path), "$col DESC"
+                    )?.use { c ->
+                        if (c.moveToFirst() && c.getLong(1) >= bestT) {
+                            bestT = c.getLong(1)
+                            bestUri = ContentUris.withAppendedId(base, c.getLong(0))
+                            bestVideo = vid
+                        }
+                    }
+                }
+                val u = bestUri ?: return@Thread
+                val bm = contentResolver.loadThumbnail(u, Size(256, 256), null)
+                lastUri = u
+                lastVideo = bestVideo
+                runOnUiThread { thumb.setImageBitmap(bm) }
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    // ---------- tap to focus ----------
+
+    private fun focusAt(nx: Float, ny: Float, px: Float, py: Float) {
+        ring.animate().cancel()
+        ring.translationX = px - dp(32)
+        ring.translationY = py - dp(32)
+        ring.visibility = View.VISIBLE
+        ring.alpha = 1f
+        ring.scaleX = 1.5f
+        ring.scaleY = 1.5f
+        ring.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
+        ui.postDelayed({ ring.animate().alpha(0f).setDuration(300).start() }, 900)
+        handler.post { setFocusRegion(nx, ny) }
+    }
+
+    private fun setFocusRegion(nx: Float, ny: Float) {
+        val c = chars ?: return
+        if (sensorOrientation != 90 || (maxAf <= 0 && maxAe <= 0)) return
+        val a = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+        val u = (0.5f + (nx - 0.5f) / zoom).coerceIn(0f, 1f)
+        val v = (0.5f + (ny - 0.5f) / zoom).coerceIn(0f, 1f)
+        val cx = a.left + (v * a.width()).toInt()
+        val cy = a.top + ((1f - u) * a.height()).toInt()
+        val half = (minOf(a.width(), a.height()) * 0.06f).toInt()
+        val r = Rect(
+            (cx - half).coerceAtLeast(a.left), (cy - half).coerceAtLeast(a.top),
+            (cx + half).coerceAtMost(a.right - 1), (cy + half).coerceAtMost(a.bottom - 1)
+        )
+        focusRegion = MeteringRectangle(r, MeteringRectangle.METERING_WEIGHT_MAX - 1)
+        applyRequest()
     }
 
     // ---------- zoom / lenses ----------
@@ -528,13 +681,14 @@ class MainActivity : Activity() {
         sb.appendLine("Камера $id, зум ${c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)}")
         sb.appendLine("Режимы: " + supported.joinToString { "${it.label}/${it.fps}" })
         sb.appendLine("FPS-диапазоны: " + fpsRanges.joinToString())
+        sb.appendLine("HDR: $hdrAvail, AF-зон: $maxAf, AE-зон: $maxAe")
         for (pid in c.physicalCameraIds) {
             val pc = mgr.getCameraCharacteristics(pid)
             val f = pc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
             val sz = pc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
             sb.appendLine("Модуль $pid: ${f}мм, сенсор $sz, экв %.1f".format(eqFocal(pc)))
         }
-        sb.appendLine("Основная: экв %.1f, ${c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()}мм".format(eqFocal(c)))
+        sb.appendLine("Основная: экв %.1f".format(eqFocal(c)))
         sb.appendLine("Кнопки: " + lenses.joinToString { "${it.label}${if (it.phys != null) "(м${it.phys})" else ""}" })
         sb.appendLine("Измерено: %.1f fps".format(measured))
         AlertDialog.Builder(this).setMessage(sb.toString()).setPositiveButton("OK", null).show()
@@ -582,6 +736,11 @@ class MainActivity : Activity() {
 
     private fun prepare(id: String) {
         val c = mgr.getCameraCharacteristics(id)
+        chars = c
+        maxAf = c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+        maxAe = c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+        hdrAvail = c.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)
+            ?.contains(CaptureRequest.CONTROL_SCENE_MODE_HDR) == true
         val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val r = c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) ?: Range(1f, 1f)
@@ -613,6 +772,8 @@ class MainActivity : Activity() {
         val photo = photoMode
         val pSize = photoSize
         tsStart = 0L
+        lowSecs = 0
+        focusRegion = null
         handler.post {
             if (g != gen) return@post
             closeAll()
@@ -694,6 +855,39 @@ class MainActivity : Activity() {
         try { cam.createCaptureSession(cfg) } catch (e: Exception) { toast("Сессия: ${e.message}") }
     }
 
+    private fun ois(b: CaptureRequest.Builder) {
+        val ok = chars?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            ?.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+        if (ok) b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+    }
+
+    private fun hq(b: CaptureRequest.Builder) {
+        val c = chars ?: return
+        fun ok(key: CameraCharacteristics.Key<IntArray>, v: Int) = c.get(key)?.contains(v) == true
+        if (ok(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY))
+            b.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+        if (ok(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES, CaptureRequest.EDGE_MODE_HIGH_QUALITY))
+            b.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+        if (ok(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES, CaptureRequest.TONEMAP_MODE_HIGH_QUALITY))
+            b.set(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_HIGH_QUALITY)
+        if (ok(CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY))
+            b.set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
+        b.set(CaptureRequest.JPEG_QUALITY, 100.toByte())
+    }
+
+    private fun scene(b: CaptureRequest.Builder) {
+        if (photoMode && hdrOn && hdrAvail) {
+            b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+            b.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
+        }
+    }
+
+    private fun regions(b: CaptureRequest.Builder) {
+        val r = focusRegion ?: return
+        if (maxAf > 0) b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(r))
+        if (maxAe > 0) b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(r))
+    }
+
     private fun applyRequest() {
         val d = device ?: return
         val s = session ?: return
@@ -715,6 +909,9 @@ class MainActivity : Activity() {
                 if (recording || !photoMode) CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
                 else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
             )
+            scene(b)
+            ois(b)
+            regions(b)
             s.setRepeatingRequest(b.build(), cb, handler)
         } catch (e: Exception) { toast("Запрос: ${e.message}") }
     }
@@ -731,33 +928,84 @@ class MainActivity : Activity() {
                 b.addTarget(rd.surface)
                 b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
                 b.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
+                b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                scene(b)
+                hq(b)
+                ois(b)
+                regions(b)
                 s.capture(b.build(), null, handler)
                 runOnUiThread {
-                    tv.animate().alpha(0.3f).setDuration(60).withEndAction {
-                        tv.animate().alpha(1f).setDuration(140).start()
+                    stage.animate().alpha(0.3f).setDuration(60).withEndAction {
+                        stage.animate().alpha(1f).setDuration(140).start()
                     }.start()
                 }
             } catch (e: Exception) { toast("Фото: ${e.message}") }
         }
     }
 
+    private fun watermark(src: ByteArray): ByteArray {
+        try {
+            val deg = when (ExifInterface(ByteArrayInputStream(src)).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                else -> 0
+            }
+            var bmp = BitmapFactory.decodeByteArray(src, 0, src.size) ?: return src
+            if (deg != 0) {
+                val m = Matrix().apply { postRotate(deg.toFloat()) }
+                bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+            }
+            val out = if (bmp.isMutable) bmp else bmp.copy(Bitmap.Config.ARGB_8888, true)
+            val cv = Canvas(out)
+            val ts = out.width * 0.022f
+            val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = ts
+                color = Color.WHITE
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                letterSpacing = 0.08f
+                setShadowLayer(ts * 0.15f, 0f, 0f, Color.argb(160, 0, 0, 0))
+            }
+            val text = "Shot on " + Build.MANUFACTURER.replaceFirstChar { it.uppercase() } + " " + Build.MODEL + "  ·  Cam8K"
+            val margin = out.width * 0.035f
+            val y = out.height - margin
+            val r = ts * 0.32f
+            val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = RED }
+            cv.drawCircle(margin + r, y - ts * 0.33f, r, dot)
+            cv.drawText(text, margin + r * 3.2f, y, p)
+            val bos = ByteArrayOutputStream()
+            out.compress(Bitmap.CompressFormat.JPEG, 97, bos)
+            return bos.toByteArray()
+        } catch (t: Throwable) {
+            return src
+        }
+    }
+
     private fun saveJpeg(r: ImageReader) {
         val img = r.acquireLatestImage() ?: return
-        try {
+        val bytes = try {
             val buf = img.planes[0].buffer
-            val bytes = ByteArray(buf.remaining())
-            buf.get(bytes)
-            val v = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "cam8k_${System.currentTimeMillis()}.jpg")
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Cam8K")
-            }
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)!!
-            contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
-            toast("Фото сохранено: Pictures/Cam8K")
-        } catch (e: Exception) {
-            toast("Ошибка сохранения фото: ${e.message}")
+            val arr = ByteArray(buf.remaining())
+            buf.get(arr)
+            arr
         } finally { img.close() }
+        val wm = wmOn
+        Thread {
+            try {
+                val data = if (wm) watermark(bytes) else bytes
+                val v = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, "cam8k_${System.currentTimeMillis()}.jpg")
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Cam8K")
+                }
+                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)!!
+                contentResolver.openOutputStream(uri)!!.use { it.write(data) }
+                toast("Фото сохранено: Pictures/Cam8K")
+                loadLast()
+            } catch (e: Exception) {
+                toast("Ошибка сохранения фото: ${e.message}")
+            }
+        }.start()
     }
 
     // ---------- video ----------
@@ -826,6 +1074,7 @@ class MainActivity : Activity() {
             contentResolver.openOutputStream(uri)!!.use { out -> f.inputStream().use { it.copyTo(out) } }
             f.delete()
             toast("Видео сохранено: Movies/Cam8K")
+            loadLast()
         } catch (e: Exception) { toast("Ошибка сохранения: ${e.message}") }
     }
 
