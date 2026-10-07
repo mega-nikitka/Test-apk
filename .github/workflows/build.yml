@@ -68,8 +68,8 @@ jobs:
           </manifest>
           EOF
           cp "$GITHUB_WORKSPACE/MainActivity.kt" app/src/main/java/com/example/cam8k/MainActivity.kt
-      - name: Patch glass
-        run: |
+           - name: Patch glass
+          run: |
           cp Glass.kt proj/app/src/main/java/com/example/cam8k/Glass.kt
                     python3 -c "import re; p='proj/app/src/main/java/com/example/cam8k/Glass.kt'; s=open(p,encoding='utf-8').read(); s=re.sub(r'class GlassPanel\(.*?\n\}\n\n', '', s, flags=re.DOTALL); s=s.replace('panels.forEach { it.refresh() }', ''); s=s.replace('ui.postDelayed(this, 130)', ''); assert 'fun refresh()' not in s; open(p,'w',encoding='utf-8').write(s)"
       
