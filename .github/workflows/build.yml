@@ -68,7 +68,19 @@ jobs:
           </manifest>
           EOF
           cp "$GITHUB_WORKSPACE/MainActivity.kt" app/src/main/java/com/example/cam8k/MainActivity.kt
-      - name: Icon and signing
+      - name: Patch glass
+        run: |
+          cp Glass.kt proj/app/src/main/java/com/example/cam8k/Glass.kt
+          python3 - <<'PY'
+          import re
+          p='proj/app/src/main/java/com/example/cam8k/MainActivity.kt'
+          s=open(p,encoding='utf-8').read()
+          s=re.sub(r'class GlassPanel\(.*?\n\}\n\nclass ShutterView','class ShutterView',s,count=1,flags=re.S)
+          s=s.replace('panels.forEach { it.refresh() }','if (!recording) refreshGlass(tv, panels)')
+          s=s.replace('ui.postDelayed(this, 130)','ui.postDelayed(this, 400)')
+          assert 'fun refresh()' not in s
+          open(p,'w',encoding='utf-8').write(s)
+          PY      - name: Icon and signing
         run: |
           if [ ! -f cam8k.p12 ]; then
             keytool -genkeypair -keystore cam8k.p12 -storetype PKCS12 -storepass cam8kpass -keypass cam8kpass -alias cam8k -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Cam8K"
