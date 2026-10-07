@@ -4,57 +4,83 @@ import android.Manifest
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.Outline
 import android.graphics.Paint
+import android.graphics.RenderEffect
+import android.graphics.Shader
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.*
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.ImageReader
+import android.media.MediaCodecList
 import android.media.MediaRecorder
-import android.os.Bundle
-import android.os.Environment
-import android.os.Handler
-import android.os.HandlerThread
-import android.os.Looper
-import android.os.SystemClock
+import android.os.*
 import android.provider.MediaStore
 import android.util.Range
 import android.util.Size
-import android.view.Gravity
-import android.view.HapticFeedbackConstants
-import android.view.MotionEvent
-import android.view.ScaleGestureDetector
-import android.view.Surface
-import android.view.TextureView
-import android.view.View
+import android.view.*
 import android.view.animation.DecelerateInterpolator
-import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
-import android.widget.Toast
+import android.widget.*
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.Executor
 import kotlin.math.abs
 
 private val RED = Color.rgb(217, 38, 44)
 
-private fun glass(r: Float, a: Int): GradientDrawable = GradientDrawable().apply {
-    setColor(Color.argb(a, 14, 14, 14))
-    cornerRadius = r
-    setStroke(2, Color.argb(70, 255, 255, 255))
+private fun sheen(r: Float) = GradientDrawable(
+    GradientDrawable.Orientation.TOP_BOTTOM,
+    intArrayOf(Color.argb(90, 255, 255, 255), Color.argb(24, 255, 255, 255))
+).apply { cornerRadius = r; setStroke(2, Color.argb(150, 255, 255, 255)) }
+
+class GlassPanel(c: Context, private val src: TextureView, private val rad: Float) : FrameLayout(c) {
+    private val back = ImageView(c)
+    private var bmp: Bitmap? = null
+
+    init {
+        back.scaleType = ImageView.ScaleType.FIT_XY
+        back.setColorFilter(Color.argb(95, 0, 0, 0))
+        back.setRenderEffect(RenderEffect.createBlurEffect(16f, 16f, Shader.TileMode.CLAMP))
+        addView(back, FrameLayout.LayoutParams(-1, -1))
+        val top = View(c)
+        top.background = sheen(rad)
+        addView(top, FrameLayout.LayoutParams(-1, -1))
+        clipToOutline = true
+        outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(v: View, o: Outline) { o.setRoundRect(0, 0, v.width, v.height, rad) }
+        }
+    }
+
+    fun refresh() {
+        if (!isShown || width == 0 || height == 0 || !src.isAvailable || src.width == 0) return
+        val loc = IntArray(2)
+        val tl = IntArray(2)
+        getLocationInWindow(loc)
+        src.getLocationInWindow(tl)
+        val s = 0.125f
+        val sw = (src.width * s).toInt().coerceAtLeast(2)
+        val sh = (src.height * s).toInt().coerceAtLeast(2)
+        val b = bmp?.takeIf { it.width == sw && it.height == sh }
+            ?: Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888).also { bmp = it }
+        src.getBitmap(b)
+        val x = ((loc[0] - tl[0]) * s).toInt().coerceIn(0, sw - 1)
+        val y = ((loc[1] - tl[1]) * s).toInt().coerceIn(0, sh - 1)
+        val w = (width * s).toInt().coerceIn(1, sw - x)
+        val h = (height * s).toInt().coerceIn(1, sh - y)
+        back.setImageBitmap(Bitmap.createBitmap(b, x, y, w, h))
+    }
 }
 
 class ShutterView(c: Context) : View(c) {
@@ -79,16 +105,16 @@ class ShutterView(c: Context) : View(c) {
         val cy = height / 2f
         val r = minOf(cx, cy)
         p.style = Paint.Style.STROKE
-        p.strokeWidth = r * 0.06f
+        p.strokeWidth = r * 0.05f
         p.color = Color.WHITE
         cv.drawCircle(cx, cy, r - p.strokeWidth, p)
         p.style = Paint.Style.FILL
         if (photo) {
             p.color = Color.WHITE
-            cv.drawCircle(cx, cy, r * 0.72f, p)
+            cv.drawCircle(cx, cy, r * 0.74f, p)
         } else {
             p.color = RED
-            val half = r * (0.70f - 0.32f * morph)
+            val half = r * (0.72f - 0.34f * morph)
             val corner = half * (1f - 0.75f * morph)
             cv.drawRoundRect(cx - half, cy - half, cx + half, cy + half, corner, corner, p)
         }
@@ -97,7 +123,7 @@ class ShutterView(c: Context) : View(c) {
 
 class MainActivity : Activity() {
 
-    private class Lens(val label: String, val zoom: Float, val phys: String?)
+    private class Lens(val label: String, val zoom: Float, val phys: String?, val ratio: Float)
     private class Mode(val label: String, val w: Int, val h: Int, val fps: Int)
 
     private val thread = HandlerThread("cam").also { it.start() }
@@ -120,6 +146,9 @@ class MainActivity : Activity() {
     @Volatile private var recording = false
     @Volatile private var gen = 0
     @Volatile private var zoomPending = false
+    @Volatile private var measured = 0.0
+    private var tsStart = 0L
+    private var frames = 0
 
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
@@ -132,12 +161,16 @@ class MainActivity : Activity() {
     private var t0 = 0L
     private var drawerOpen = false
     private var zoomAnim: ValueAnimator? = null
+    private val panels = mutableListOf<GlassPanel>()
 
     private lateinit var tv: TextureView
     private lateinit var shutter: ShutterView
     private lateinit var timer: TextView
-    private lateinit var pill: TextView
-    private lateinit var drawer: LinearLayout
+    private lateinit var pillText: TextView
+    private lateinit var infoLine: TextView
+    private lateinit var pill: GlassPanel
+    private lateinit var drawer: GlassPanel
+    private lateinit var lensPanel: GlassPanel
     private lateinit var resRow: LinearLayout
     private lateinit var fpsRow: LinearLayout
     private lateinit var lensRow: LinearLayout
@@ -155,16 +188,39 @@ class MainActivity : Activity() {
         }
     }
 
+    private val glassTick = object : Runnable {
+        override fun run() {
+            panels.forEach { it.refresh() }
+            ui.postDelayed(this, 130)
+        }
+    }
+
+    private val cb = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+            val ts = res.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+            if (tsStart == 0L) { tsStart = ts; frames = 0; return }
+            frames++
+            if (ts - tsStart >= 1_000_000_000L) {
+                measured = frames * 1e9 / (ts - tsStart)
+                tsStart = ts
+                frames = 0
+                runOnUiThread { refreshInfo() }
+            }
+        }
+    }
+
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_LONG).show() }
 
-    private fun chip(t: String, click: () -> Unit) = TextView(this).apply {
+    private fun chip(t: String, minW: Int = 0, click: () -> Unit) = TextView(this).apply {
         text = t
         textSize = 14f
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         letterSpacing = 0.08f
+        gravity = Gravity.CENTER
+        minWidth = dp(minW)
         setTextColor(Color.WHITE)
-        setPadding(dp(13), dp(7), dp(13), dp(7))
+        setPadding(dp(12), dp(7), dp(12), dp(7))
         setOnClickListener { click() }
     }
 
@@ -172,8 +228,15 @@ class MainActivity : Activity() {
         text = t
         textSize = 10f
         letterSpacing = 0.18f
-        setTextColor(Color.argb(150, 255, 255, 255))
+        setTextColor(Color.argb(170, 255, 255, 255))
         setPadding(dp(6), dp(6), 0, dp(2))
+    }
+
+    private fun panel(content: View, r: Int, w: Int = -2): GlassPanel {
+        val p = GlassPanel(this, tv, dp(r).toFloat())
+        p.addView(content, FrameLayout.LayoutParams(w, -2))
+        panels += p
+        return p
     }
 
     override fun onCreate(b: Bundle?) {
@@ -209,16 +272,29 @@ class MainActivity : Activity() {
         )
         root.addView(scrim, FrameLayout.LayoutParams(-1, dp(260), Gravity.BOTTOM))
 
-        pill = TextView(this).apply {
+        pillText = TextView(this).apply {
             textSize = 13f
             typeface = Typeface.MONOSPACE
             letterSpacing = 0.1f
             setTextColor(Color.WHITE)
-            setPadding(dp(16), dp(7), dp(16), dp(7))
-            background = glass(dp(18).toFloat(), 170)
-            setOnClickListener { toggleDrawer(!drawerOpen) }
+            setPadding(dp(18), dp(8), dp(18), dp(8))
         }
+        pill = panel(pillText, 18)
+        pill.setOnClickListener { toggleDrawer(!drawerOpen) }
+        pill.setOnLongClickListener { showInfo(); true }
         root.addView(pill, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(10) })
+
+        val dot = View(this)
+        dot.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(RED) }
+        root.addView(dot, FrameLayout.LayoutParams(dp(14), dp(14), Gravity.TOP or Gravity.END).apply { topMargin = dp(22); marginEnd = dp(22) })
+
+        infoLine = TextView(this).apply {
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            letterSpacing = 0.1f
+            setTextColor(Color.argb(200, 255, 255, 255))
+        }
+        root.addView(infoLine, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(60) })
 
         timer = TextView(this).apply {
             setTextColor(RED)
@@ -226,27 +302,25 @@ class MainActivity : Activity() {
             typeface = Typeface.MONOSPACE
             visibility = View.GONE
         }
-        root.addView(timer, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { topMargin = dp(16); marginStart = dp(18) })
+        root.addView(timer, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { topMargin = dp(18); marginStart = dp(18) })
 
-        drawer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = glass(dp(22).toFloat(), 225)
-            setPadding(dp(12), dp(8), dp(12), dp(12))
-            visibility = View.GONE
-        }
         resRow = LinearLayout(this)
         fpsRow = LinearLayout(this)
-        drawer.addView(caption("РАЗРЕШЕНИЕ"))
-        drawer.addView(resRow)
-        drawer.addView(caption("КАДРОВ В СЕКУНДУ"))
-        drawer.addView(fpsRow)
-        root.addView(drawer, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(52); marginStart = dp(12); marginEnd = dp(12) })
-
-        lensRow = LinearLayout(this).apply {
-            background = glass(dp(22).toFloat(), 150)
-            setPadding(dp(6), dp(2), dp(6), dp(2))
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(12))
+            addView(caption("РАЗРЕШЕНИЕ"))
+            addView(resRow)
+            addView(caption("КАДРОВ В СЕКУНДУ"))
+            addView(fpsRow)
         }
-        root.addView(lensRow, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(168) })
+        drawer = panel(col, 22, -1)
+        drawer.visibility = View.GONE
+        root.addView(drawer, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(88); marginStart = dp(12); marginEnd = dp(12) })
+
+        lensRow = LinearLayout(this).apply { setPadding(dp(6), dp(3), dp(6), dp(3)) }
+        lensPanel = panel(lensRow, 24)
+        root.addView(lensPanel, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(168) })
 
         val modes = LinearLayout(this)
         modeVideo = chip("ВИДЕО") { switchPhoto(false) }
@@ -282,20 +356,28 @@ class MainActivity : Activity() {
         startPreview()
     }
 
-    override fun onResume() { super.onResume(); if (tv.isAvailable) startPreview() }
+    override fun onResume() {
+        super.onResume()
+        ui.post(glassTick)
+        if (tv.isAvailable) startPreview()
+    }
 
     override fun onPause() {
         super.onPause()
+        ui.removeCallbacks(glassTick)
         gen++
         handler.post { if (recording) finishRecording(false) else closeAll() }
+    }    // ---------- UI helpers ----------
+
+    private fun fmt(z: Float) =
+        if (abs(z - Math.round(z)) < 0.05f) "${Math.round(z)}" else String.format(Locale.US, "%.1f", z)
+
+    private fun refreshInfo() {
+        infoLine.text = "%.0f FPS · %s".format(measured, if (physId != null) "МОДУЛЬ $physId" else "ОСНОВНАЯ")
     }
 
-    // ---------- UI helpers ----------
-
-    private fun fmt(z: Float) = if (abs(z - Math.round(z)) < 0.05f) "${Math.round(z)}x" else "%.1f".format(z)
-
     private fun refreshPill() {
-        pill.text = if (photoMode) "ФОТО · %.0f MP".format(photoSize.width * photoSize.height / 1e6)
+        pillText.text = if (photoMode) "ФОТО · %.0f MP".format(photoSize.width * photoSize.height / 1e6)
         else "${cur.label} · ${cur.fps}  ▾"
     }
 
@@ -309,7 +391,10 @@ class MainActivity : Activity() {
 
     private fun activeLens(): Int {
         var idx = 0
-        lenses.forEachIndexed { i, l -> if (l.phys == physId && l.zoom <= zoom + 0.01f) idx = i }
+        lenses.forEachIndexed { i, l ->
+            if (physId != null) { if (l.phys == physId) idx = i }
+            else if (l.phys == null && l.zoom <= zoom + 0.01f) idx = i
+        }
         return idx
     }
 
@@ -319,7 +404,7 @@ class MainActivity : Activity() {
             val v = lensRow.getChildAt(i) as TextView
             val on = i == a
             v.setTextColor(if (on) RED else Color.WHITE)
-            v.text = if (on && lenses[i].phys == null) fmt(zoom) else lenses[i].label
+            v.text = if (on) (if (lenses[i].phys == null) fmt(zoom) else lenses[i].label) + "x" else lenses[i].label
             val s = if (on) 1.15f else 1f
             v.animate().scaleX(s).scaleY(s).setDuration(120).start()
         }
@@ -407,23 +492,52 @@ class MainActivity : Activity() {
         } else animateZoom(l.zoom.coerceIn(zoomMin, zoomMax))
     }
 
+    private fun eqFocal(cc: CameraCharacteristics): Float {
+        val f = cc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: return 0f
+        val w = cc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)?.width ?: return 0f
+        return f * 36f / w
+    }
+
     private fun buildLenses(c: CameraCharacteristics, r: Range<Float>) {
-        val list = mutableListOf<Lens>()
-        for (z in listOf(0.6f, 1f, 2f, 3.2f))
-            if (z >= r.lower - 0.01f && z <= r.upper) list += Lens(fmt(z), z, null)
-        if (list.none { it.zoom == 1f }) list += Lens("1x", 1f, null)
-        if (r.lower >= 0.99f && c.physicalCameraIds.isNotEmpty()) {
-            val main = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 1f
-            for (pid in c.physicalCameraIds) {
-                val pf = mgr.getCameraCharacteristics(pid)
-                    .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: continue
-                val ratio = pf / main
-                if (abs(ratio - 1f) > 0.15f) list += Lens("%.1f".format(ratio), 1f, pid)
-            }
+        val phys = mutableListOf<Lens>()
+        val mainEq = eqFocal(c)
+        val mainF = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 1f
+        for (pid in c.physicalCameraIds) {
+            val pc = mgr.getCameraCharacteristics(pid)
+            val e = eqFocal(pc)
+            val ratio = if (e > 0f && mainEq > 0f) e / mainEq
+            else (pc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: mainF) / mainF
+            if (abs(ratio - 1f) > 0.15f) phys += Lens(fmt(Math.round(ratio * 10) / 10f), 1f, pid, ratio)
         }
-        lenses = list.sortedBy { if (it.phys == null) it.zoom else it.label.toFloatOrNull() ?: 1f }
+        val list = mutableListOf<Lens>()
+        list += Lens("1", 1f, null, 1f)
+        if (r.lower <= 0.65f) list += Lens("0.6", 0.6f, null, 0.6f)
+        if (r.upper >= 2f && phys.none { abs(it.ratio - 2f) < 0.3f }) list += Lens("2", 2f, null, 2f)
+        if (r.upper >= 3.2f && phys.none { it.ratio >= 2.5f }) list += Lens("3.2", 3.2f, null, 3.2f)
+        list += phys
+        lenses = list.sortedBy { it.ratio }
         lensRow.removeAllViews()
-        lenses.forEach { l -> lensRow.addView(chip(l.label) { onLens(l) }) }
+        lenses.forEach { l -> lensRow.addView(chip(l.label, 44) { onLens(l) }) }
+        refreshLenses()
+    }
+
+    private fun showInfo() {
+        val sb = StringBuilder()
+        val id = camId()
+        val c = mgr.getCameraCharacteristics(id)
+        sb.appendLine("Камера $id, зум ${c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)}")
+        sb.appendLine("Режимы: " + supported.joinToString { "${it.label}/${it.fps}" })
+        sb.appendLine("FPS-диапазоны: " + fpsRanges.joinToString())
+        for (pid in c.physicalCameraIds) {
+            val pc = mgr.getCameraCharacteristics(pid)
+            val f = pc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+            val sz = pc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            sb.appendLine("Модуль $pid: ${f}мм, сенсор $sz, экв %.1f".format(eqFocal(pc)))
+        }
+        sb.appendLine("Основная: экв %.1f, ${c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()}мм".format(eqFocal(c)))
+        sb.appendLine("Кнопки: " + lenses.joinToString { "${it.label}${if (it.phys != null) "(м${it.phys})" else ""}" })
+        sb.appendLine("Измерено: %.1f fps".format(measured))
+        AlertDialog.Builder(this).setMessage(sb.toString()).setPositiveButton("OK", null).show()
     }
 
     // ---------- camera setup ----------
@@ -433,6 +547,13 @@ class MainActivity : Activity() {
             (if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK)
     }
 
+    private fun encOk(w: Int, h: Int, f: Int): Boolean = try {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { ci ->
+            ci.isEncoder && ci.supportedTypes.any { it.equals("video/hevc", true) } &&
+                ci.getCapabilitiesForType("video/hevc").videoCapabilities.areSizeAndRateSupported(w, h, f.toDouble())
+        }
+    } catch (e: Exception) { true }
+
     private fun buildModes(c: CameraCharacteristics, map: StreamConfigurationMap?) {
         val sizes = map?.getOutputSizes(MediaRecorder::class.java)?.toList() ?: emptyList()
         val ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList() ?: emptyList()
@@ -441,8 +562,10 @@ class MainActivity : Activity() {
         val list = mutableListOf<Mode>()
         for ((name, w, h) in tiers) {
             if (sizes.none { it.width == w && it.height == h }) continue
-            for (f in listOf(60, 30, 24))
-                if (ranges.any { it.lower <= f && f <= it.upper }) list += Mode(name, w, h, f)
+            for (f in listOf(60, 30, 24)) {
+                val inRange = ranges.any { it.lower <= f && f <= it.upper }
+                if ((inRange || f == 60) && encOk(w, h, f)) list += Mode(name, w, h, f)
+            }
         }
         if (list.isEmpty()) list += Mode("1080", 1920, 1080, 30)
         supported = list
@@ -471,13 +594,11 @@ class MainActivity : Activity() {
         layoutPreview()
         refreshPill()
         refreshMode()
-        refreshLenses()
+        refreshInfo()
         if (drawerOpen) refreshDrawer()
         val bs = if (photoMode) previewBufferFor(map, photoSize) else Size(1920, 1080)
         tv.surfaceTexture?.setDefaultBufferSize(bs.width, bs.height)
-    }
-
-    private fun startPreview() = runOnUiThread { startPreviewUi() }
+    }    private fun startPreview() = runOnUiThread { startPreviewUi() }
 
     @SuppressLint("MissingPermission")
     private fun startPreviewUi() {
@@ -487,10 +608,11 @@ class MainActivity : Activity() {
         val g = ++gen
         val id = camId()
         prepare(id)
-        val st =  tv.surfaceTexture ?: return
+        val st = tv.surfaceTexture ?: return
         val mode = cur
         val photo = photoMode
         val pSize = photoSize
+        tsStart = 0L
         handler.post {
             if (g != gen) return@post
             closeAll()
@@ -540,7 +662,9 @@ class MainActivity : Activity() {
         mr.setOutputFile(file!!.absolutePath)
         mr.prepare()
         recSurface = mr.surface
-    }    private fun createSession(cam: CameraDevice, g: Int, photo: Boolean) {
+    }
+
+    private fun createSession(cam: CameraDevice, g: Int, photo: Boolean) {
         val p = OutputConfiguration(previewSurface!!)
         val second = OutputConfiguration(if (photo) reader!!.surface else recSurface!!)
         physId?.let { p.setPhysicalCameraId(it); second.setPhysicalCameraId(it) }
@@ -591,7 +715,7 @@ class MainActivity : Activity() {
                 if (recording || !photoMode) CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
                 else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
             )
-            s.setRepeatingRequest(b.build(), null, handler)
+            s.setRepeatingRequest(b.build(), cb, handler)
         } catch (e: Exception) { toast("Запрос: ${e.message}") }
     }
 
@@ -634,7 +758,9 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             toast("Ошибка сохранения фото: ${e.message}")
         } finally { img.close() }
-    }    // ---------- video ----------
+    }
+
+    // ---------- video ----------
 
     private fun toggleRecord() {
         handler.post {
@@ -704,4 +830,4 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() { thread.quitSafely(); super.onDestroy() }
-}
+                      }
